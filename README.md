@@ -61,7 +61,7 @@ Xray-core не умеет ограничивать скорость отдель
 ## Установка
 
 ```bash
-git clone https://github.com/USERNAME/vpnlimit.git
+git clone https://github.com/imslan/vpnlimit.git
 cd vpnlimit
 sudo install -m 755 vpnlimit /usr/local/bin/vpnlimit
 ```
@@ -69,7 +69,7 @@ sudo install -m 755 vpnlimit /usr/local/bin/vpnlimit
 Или одной командой:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/USERNAME/vpnlimit/main/vpnlimit -o /usr/local/bin/vpnlimit
+sudo curl -fsSL https://github.com/imslan/vpnlimit/raw/refs/heads/main/vpnlimit -o /usr/local/bin/vpnlimit
 sudo chmod +x /usr/local/bin/vpnlimit
 ```
 
