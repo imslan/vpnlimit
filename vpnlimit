@@ -49,15 +49,26 @@ wl_show() {
 }
 
 wl_add() {
-  local ip=${1,,} cm=$2 fam
-  if ! [[ "$ip" =~ ^[0-9a-f.:/]+$ ]]; then echo "${R}Неверный адрес: $1${N}"; return 1; fi
+  local ip cm=$2 fam tmp err
+  # обрезаем пробелы, табы и \r по краям (частая проблема при копировании)
+  ip="${1#"${1%%[![:space:]]*}"}"
+  ip="${ip%"${ip##*[![:space:]]}"}"
+  ip=${ip,,}
+  if [ -z "$ip" ]; then echo "${R}Пустой адрес.${N}"; return 1; fi
+  if ! [[ "$ip" =~ ^[0-9a-f.:/]+$ ]]; then
+    echo "${R}Адрес содержит недопустимые символы: '$1'${N}"; return 1
+  fi
   if wl_ips | grep -qxF "$ip"; then echo "${Y}$ip уже в белом списке.${N}"; return 1; fi
   if [[ "$ip" == *:* ]]; then fam=ipv6_addr; else fam=ipv4_addr; fi
-  # проверяем адрес самим nft (режим -c ничего не применяет)
-  if ! printf 'table inet vpnlimit_check { set t { type %s; flags interval; elements = { %s } } }\n' \
-         "$fam" "$ip" | "$NFT" -c -f - >/dev/null 2>&1; then
-    echo "${R}Неверный адрес: $ip${N}"; return 1
+  # проверка через временный файл (режим -c ничего не применяет)
+  tmp=$(mktemp)
+  printf 'table inet vpnlimit_check {\n  set t {\n    type %s; flags interval;\n    elements = { %s }\n  }\n}\n' \
+    "$fam" "$ip" > "$tmp"
+  if ! err=$("$NFT" -c -f "$tmp" 2>&1); then
+    rm -f "$tmp"
+    echo "${R}nft не принял адрес $ip:${N}"; echo "$err"; return 1
   fi
+  rm -f "$tmp"
   mkdir -p "$CONF_DIR"
   if [ -n "$cm" ]; then printf '%s  # %s\n' "$ip" "$cm" >> "$WL"; else echo "$ip" >> "$WL"; fi
   echo "${G}Добавлен в белый список: $ip${N}"
