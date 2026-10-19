@@ -69,7 +69,7 @@ sudo install -m 755 vpnlimit /usr/local/bin/vpnlimit
 Или одной командой:
 
 ```bash
-sudo curl -fsSL https://github.com/imslan/vpnlimit/raw/refs/heads/main/vpnlimit -o /usr/local/bin/vpnlimit
+sudo curl -fsSL https://github.com/imslan/vpnlimit/blob/main/vpnlimit -o /usr/local/bin/vpnlimit
 sudo chmod +x /usr/local/bin/vpnlimit
 ```
 
