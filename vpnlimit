@@ -1,11 +1,12 @@
 #!/bin/bash
 # vpnlimit — ограничение скорости на каждый IP клиента для портов Xray
 #
-#   vpnlimit           — интерактивное меню
-#   vpnlimit on        — включить лимит с сохранёнными настройками
-#   vpnlimit off       — выключить лимит
-#   vpnlimit status    — показать состояние
-#   vpnlimit <Мбит>    — задать скорость в обе стороны и включить
+#   vpnlimit                       — интерактивное меню
+#   vpnlimit on | off | status     — включить / выключить / состояние
+#   vpnlimit <Мбит>                — задать скорость в обе стороны и включить
+#   vpnlimit wl                    — показать белый список
+#   vpnlimit wl add <IP> [комм.]   — добавить IP или подсеть в белый список
+#   vpnlimit wl del <IP>           — убрать из белого списка
 #
 # Работает только со своей таблицей "inet vpnlimit".
 # /etc/nftables.conf, службу nftables, ufw и правила Docker не трогает.
@@ -13,8 +14,10 @@
 TABLE="inet vpnlimit"
 CONF_DIR="/etc/vpnlimit"
 CONF="$CONF_DIR/vpnlimit.conf"
+WL="$CONF_DIR/whitelist.txt"
 UNIT="/etc/systemd/system/vpnlimit.service"
 SELF=$(readlink -f "$0")
+SSH_IP=${SSH_CLIENT%% *}
 
 [ "$(id -u)" -eq 0 ] || { echo "Запускайте от root"; exit 1; }
 NFT=$(command -v nft) || { echo "nft не найден: apt install nftables"; exit 1; }
@@ -36,21 +39,128 @@ save_conf() {
 }
 fmt_rate() { if (( $1 == 0 )); then echo "без ограничения"; else echo "$1 Мбит/с на IP"; fi; }
 
+# ---------- белый список ----------
+wl_ips()   { awk '/^[ \t]*(#|$)/{next} {print $1}' "$WL" 2>/dev/null; }
+wl_count() { wl_ips | grep -c .; }
+
+wl_show() {
+  if (( $(wl_count) == 0 )); then echo "  (пусто)"; return; fi
+  awk '/^[ \t]*(#|$)/{next} {i++; printf "  %2d) %s\n", i, $0}' "$WL"
+}
+
+wl_add() {
+  local ip=${1,,} cm=$2 fam
+  if ! [[ "$ip" =~ ^[0-9a-f.:/]+$ ]]; then echo "${R}Неверный адрес: $1${N}"; return 1; fi
+  if wl_ips | grep -qxF "$ip"; then echo "${Y}$ip уже в белом списке.${N}"; return 1; fi
+  if [[ "$ip" == *:* ]]; then fam=ipv6_addr; else fam=ipv4_addr; fi
+  # проверяем адрес самим nft (режим -c ничего не применяет)
+  if ! printf 'table inet vpnlimit_check { set t { type %s; flags interval; elements = { %s } } }\n' \
+         "$fam" "$ip" | "$NFT" -c -f - >/dev/null 2>&1; then
+    echo "${R}Неверный адрес: $ip${N}"; return 1
+  fi
+  mkdir -p "$CONF_DIR"
+  if [ -n "$cm" ]; then printf '%s  # %s\n' "$ip" "$cm" >> "$WL"; else echo "$ip" >> "$WL"; fi
+  echo "${G}Добавлен в белый список: $ip${N}"
+}
+
+wl_del_ip() {
+  local ip=${1,,}
+  if ! wl_ips | grep -qxF "$ip"; then echo "${Y}$ip нет в белом списке.${N}"; return 1; fi
+  awk -v ip="$ip" '$1 != ip' "$WL" > "$WL.tmp" && mv "$WL.tmp" "$WL"
+  echo "${G}Удалён из белого списка: $ip${N}"
+}
+
+wl_del_num() {
+  local n total
+  total=$(wl_count)
+  (( total )) || { echo "Список пуст."; return 1; }
+  wl_show; echo
+  read -rp "Номер для удаления (Enter — отмена): " n
+  [ -z "$n" ] && { echo "Отменено."; return 1; }
+  if ! [[ "$n" =~ ^[0-9]+$ ]] || (( 10#$n < 1 || 10#$n > total )); then
+    echo "${R}Нет такого номера.${N}"; return 1
+  fi
+  wl_del_ip "$(wl_ips | sed -n "$((10#$n))p")"
+}
+
+wl_pick_active() {
+  is_on || { echo "Лимит выключен — активных клиентов не видно."; return 1; }
+  local ips n cm i
+  mapfile -t ips < <(client_ips)
+  (( ${#ips[@]} )) || { echo "Сейчас нет активных клиентов."; return 1; }
+  echo "Активные клиенты:"
+  for i in "${!ips[@]}"; do printf '  %2d) %s\n' $((i+1)) "${ips[$i]}"; done
+  echo
+  read -rp "Номер (Enter — отмена): " n
+  [ -z "$n" ] && { echo "Отменено."; return 1; }
+  if ! [[ "$n" =~ ^[0-9]+$ ]] || (( 10#$n < 1 || 10#$n > ${#ips[@]} )); then
+    echo "${R}Нет такого номера.${N}"; return 1
+  fi
+  read -rp "Комментарий (необязательно): " cm
+  wl_add "${ips[$((10#$n - 1))]}" "$cm"
+}
+
+wl_menu() {
+  local c ip cm
+  while true; do
+    clear
+    echo "${B}Белый список${N} ${D}(эти адреса не ограничиваются)${N}"
+    echo
+    wl_show
+    echo
+    echo "  ${C}1${N}) Добавить IP или подсеть"
+    [ -n "$SSH_IP" ] && echo "  ${C}2${N}) Добавить мой текущий IP ($SSH_IP)"
+    echo "  ${C}3${N}) Выбрать из активных клиентов"
+    echo "  ${C}4${N}) Удалить из списка"
+    echo "  ${C}0${N}) Назад"
+    echo
+    read -rp "Выберите пункт: " c
+    echo
+    case "$c" in
+      1) read -rp "IP или подсеть (например 1.2.3.4 или 10.0.0.0/24, Enter — отмена): " ip
+         if [ -n "$ip" ]; then
+           read -rp "Комментарий (необязательно): " cm
+           wl_add "$ip" "$cm" && reapply
+         else echo "Отменено."; fi
+         pause ;;
+      2) if [ -n "$SSH_IP" ]; then wl_add "$SSH_IP" "мой IP (SSH)" && reapply; pause; fi ;;
+      3) wl_pick_active && reapply; pause ;;
+      4) wl_del_num && reapply; pause ;;
+      0|q|Q) return ;;
+    esac
+  done
+}
+
 # ---------- правила nftables ----------
 is_on()   { "$NFT" list table $TABLE >/dev/null 2>&1; }
 is_auto() { systemctl is-enabled vpnlimit >/dev/null 2>&1; }
 
 gen_rules() {
-  local dl=$(( DL * 125000 )) ul=$(( UL * 125000 )) s
+  local dl=$(( DL * 125000 )) ul=$(( UL * 125000 )) s wl4 wl6
+  wl4=$(wl_ips | grep -v ':' | paste -sd, -)
+  wl6=$(wl_ips | grep ':'    | paste -sd, -)
+
   echo "table $TABLE"
   echo "delete table $TABLE"
   echo "table $TABLE {"
   for s in dl4 ul4; do echo "  set $s { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 2m; }"; done
   for s in dl6 ul6; do echo "  set $s { type ipv6_addr; size 65535; flags dynamic,timeout; timeout 2m; }"; done
+
+  echo "  set allow4 {"
+  echo "    type ipv4_addr; flags interval; auto-merge;"
+  [ -n "$wl4" ] && echo "    elements = { $wl4 }"
+  echo "  }"
+  echo "  set allow6 {"
+  echo "    type ipv6_addr; flags interval; auto-merge;"
+  [ -n "$wl6" ] && echo "    elements = { $wl6 }"
+  echo "  }"
+
   if (( DL > 0 )); then
     cat <<EOF
   chain out {
     type filter hook output priority filter; policy accept;
+    ip  daddr @allow4 accept
+    ip6 daddr @allow6 accept
     meta l4proto { tcp, udp } th sport { $PORTS } update @dl4 { ip daddr  limit rate over $dl bytes/second burst 524288 bytes } drop
     meta l4proto { tcp, udp } th sport { $PORTS } update @dl6 { ip6 daddr limit rate over $dl bytes/second burst 524288 bytes } drop
   }
@@ -60,6 +170,8 @@ EOF
     cat <<EOF
   chain in {
     type filter hook input priority filter; policy accept;
+    ip  saddr @allow4 accept
+    ip6 saddr @allow6 accept
     meta l4proto { tcp, udp } th dport { $PORTS } update @ul4 { ip saddr  limit rate over $ul bytes/second burst 524288 bytes } drop
     meta l4proto { tcp, udp } th dport { $PORTS } update @ul6 { ip6 saddr limit rate over $ul bytes/second burst 524288 bytes } drop
   }
@@ -87,7 +199,7 @@ rules_off() { "$NFT" delete table $TABLE 2>/dev/null; return 0; }
 
 reapply() {
   if ! is_on; then
-    echo "Сохранено. Лимит сейчас выключен — включите его пунктом 1."; return
+    echo "Сохранено. Лимит сейчас выключен."; return
   fi
   if (( DL == 0 && UL == 0 )); then
     rules_off; echo "${Y}Оба лимита равны 0 — лимит выключен.${N}"; return
@@ -131,6 +243,7 @@ clients_live() {
   while true; do
     clear
     echo "${B}Клиенты под лимитом${N} ${D}(активность за последние ~2 минуты, обновление каждые 2 с)${N}"
+    echo "${D}Адреса из белого списка здесь не показываются.${N}"
     echo
     if ! is_on; then
       echo "  Лимит выключен."
@@ -188,7 +301,7 @@ edit_ports() {
 
 reset_all() {
   local a
-  read -rp "Удалить лимит, автозагрузку и настройки? [y/N]: " a
+  read -rp "Удалить лимит, автозагрузку, настройки и белый список? [y/N]: " a
   [[ "$a" =~ ^[yYдД]$ ]] || { echo "Отменено."; return; }
   rules_off; auto_off; rm -rf "$CONF_DIR"
   echo "${G}Всё удалено.${N} Сам скрипт можно удалить командой: rm $SELF"
@@ -204,6 +317,7 @@ header() {
   echo "  Скачивание:    $(fmt_rate "$DL")"
   echo "  Загрузка:      $(fmt_rate "$UL")"
   echo "  Порты:         $PORTS"
+  echo "  Белый список:  $(wl_count) адр."
   echo "  Автозагрузка:  $au"
   echo "  Клиентов:      $cnt"
 }
@@ -222,6 +336,7 @@ menu() {
     if is_auto; then echo "  ${C}5${N}) Отключить автозагрузку"
     else echo "  ${C}5${N}) Включить автозагрузку (лимит сохранится после перезагрузки)"; fi
     echo "  ${C}6${N}) Клиенты под лимитом"
+    echo "  ${C}7${N}) Белый список ($(wl_count))"
     echo "  ${C}9${N}) Удалить всё (сброс)"
     echo "  ${C}0${N}) Выход"
     echo
@@ -243,22 +358,42 @@ menu() {
            auto_on; echo "${G}Автозагрузка включена.${N} После перезагрузки лимит включится с текущими настройками."
          fi; pause ;;
       6) clients_live ;;
+      7) wl_menu ;;
       9) reset_all; pause ;;
       0|q|Q) clear; exit 0 ;;
     esac
   done
 }
 
-usage() { echo "Использование: vpnlimit [on | off | status | <Мбит>]  (без аргументов — меню)"; }
+usage() {
+  cat <<EOF
+Использование:
+  vpnlimit                       меню
+  vpnlimit on | off | status     включить / выключить / состояние
+  vpnlimit <Мбит>                скорость в обе стороны и включить
+  vpnlimit wl                    показать белый список
+  vpnlimit wl add <IP> [комм.]   добавить IP или подсеть
+  vpnlimit wl del <IP>           удалить из белого списка
+EOF
+}
 
 # ---------- запуск ----------
 load_conf
 case "$1" in
   ""|menu) menu ;;
   on)      rules_on || exit 1
-           echo "Лимит включён: скачивание $(fmt_rate "$DL"), загрузка $(fmt_rate "$UL"), порты $PORTS" ;;
+           echo "Лимит включён: скачивание $(fmt_rate "$DL"), загрузка $(fmt_rate "$UL"), порты $PORTS, белый список: $(wl_count)" ;;
   off)     rules_off; echo "Лимит выключен" ;;
   status)  header ;;
+  wl|whitelist)
+    case "$2" in
+      ""|list) wl_show ;;
+      add)     [ -n "$3" ] || { usage; exit 1; }
+               wl_add "$3" "${*:4}" && reapply ;;
+      del|rm)  [ -n "$3" ] || { usage; exit 1; }
+               wl_del_ip "$3" && reapply ;;
+      *)       usage; exit 1 ;;
+    esac ;;
   -h|--help) usage ;;
   *)       if [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 10000 )); then
              DL=$((10#$1)); UL=$DL; save_conf
