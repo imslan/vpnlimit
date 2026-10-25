@@ -4,6 +4,7 @@
 #   vpnlimit                       — интерактивное меню
 #   vpnlimit on | off | status     — включить / выключить / состояние
 #   vpnlimit <Мбит>                — задать скорость в обе стороны и включить
+#   vpnlimit burst [МБ]            — показать или задать объём буста (0 — без буста)
 #   vpnlimit wl                    — показать белый список
 #   vpnlimit wl add <IP> [комм.]   — добавить IP или подсеть в белый список
 #   vpnlimit wl del <IP>           — убрать из белого списка
@@ -30,14 +31,25 @@ fi
 
 # ---------- настройки ----------
 load_conf() {
-  DL=7; UL=7; PORTS="443"
+  DL=7; UL=7; BURST=0; PORTS="443"
   [ -f "$CONF" ] && . "$CONF"
 }
 save_conf() {
   mkdir -p "$CONF_DIR"
-  printf 'DL=%s\nUL=%s\nPORTS="%s"\n' "$DL" "$UL" "$PORTS" > "$CONF"
+  printf 'DL=%s\nUL=%s\nBURST=%s\nPORTS="%s"\n' "$DL" "$UL" "$BURST" "$PORTS" > "$CONF"
 }
 fmt_rate() { if (( $1 == 0 )); then echo "без ограничения"; else echo "$1 Мбит/с на IP"; fi; }
+fmt_burst() {
+  local t
+  if (( BURST == 0 )); then echo "нет"; return; fi
+  if (( DL > 0 )); then
+    # время, за которое пустой запас наполняется при лимите скачивания (с округлением вверх)
+    t=$(( (BURST * 8388608 + DL * 1000000 - 1) / (DL * 1000000) ))
+    echo "$BURST МБ на IP (восстановление ~$t с)"
+  else
+    echo "$BURST МБ на IP"
+  fi
+}
 
 # ---------- белый список ----------
 wl_ips()   { awk '/^[ \t]*(#|$)/{next} {print $1}' "$WL" 2>/dev/null; }
@@ -147,7 +159,9 @@ is_on()   { "$NFT" list table $TABLE >/dev/null 2>&1; }
 is_auto() { systemctl is-enabled vpnlimit >/dev/null 2>&1; }
 
 gen_rules() {
-  local dl=$(( DL * 125000 )) ul=$(( UL * 125000 )) s wl4 wl6
+  local dl=$(( DL * 125000 )) ul=$(( UL * 125000 )) bb=524288 s wl4 wl6
+  # буст — объём запаса на IP; без буста — минимальный буфер 512 КБ
+  (( BURST > 0 )) && bb=$(( BURST * 1048576 ))
   wl4=$(wl_ips | grep -v ':' | paste -sd, -)
   wl6=$(wl_ips | grep ':'    | paste -sd, -)
 
@@ -172,8 +186,8 @@ gen_rules() {
     type filter hook output priority filter; policy accept;
     ip  daddr @allow4 accept
     ip6 daddr @allow6 accept
-    meta l4proto { tcp, udp } th sport { $PORTS } update @dl4 { ip daddr  limit rate over $dl bytes/second burst 524288 bytes } drop
-    meta l4proto { tcp, udp } th sport { $PORTS } update @dl6 { ip6 daddr limit rate over $dl bytes/second burst 524288 bytes } drop
+    meta l4proto { tcp, udp } th sport { $PORTS } update @dl4 { ip daddr  limit rate over $dl bytes/second burst $bb bytes } drop
+    meta l4proto { tcp, udp } th sport { $PORTS } update @dl6 { ip6 daddr limit rate over $dl bytes/second burst $bb bytes } drop
   }
 EOF
   fi
@@ -183,8 +197,8 @@ EOF
     type filter hook input priority filter; policy accept;
     ip  saddr @allow4 accept
     ip6 saddr @allow6 accept
-    meta l4proto { tcp, udp } th dport { $PORTS } update @ul4 { ip saddr  limit rate over $ul bytes/second burst 524288 bytes } drop
-    meta l4proto { tcp, udp } th dport { $PORTS } update @ul6 { ip6 saddr limit rate over $ul bytes/second burst 524288 bytes } drop
+    meta l4proto { tcp, udp } th dport { $PORTS } update @ul4 { ip saddr  limit rate over $ul bytes/second burst $bb bytes } drop
+    meta l4proto { tcp, udp } th dport { $PORTS } update @ul6 { ip6 saddr limit rate over $ul bytes/second burst $bb bytes } drop
   }
 EOF
   fi
@@ -285,6 +299,22 @@ ask_rate() {
   echo "${R}Нужно целое число от 0 до 10000.${N}"; return 1
 }
 
+ask_burst() {
+  local v
+  echo "Буст — запас трафика, который клиент получает на полной скорости сервера."
+  echo "Короткие действия (страницы, документы, почта) укладываются в него и идут без лимита."
+  echo "Длительная загрузка (видео, большие файлы) после него идёт со скоростью лимита."
+  echo "Запас восстанавливается со скоростью лимита. Рекомендуется 20–30 МБ."
+  echo "Сейчас: $(fmt_burst)"
+  echo
+  read -rp "Объём буста, МБ (0 — без буста, Enter — отмена): " v
+  [ -z "$v" ] && { echo "Отменено."; return 1; }
+  if [[ "$v" =~ ^[0-9]+$ ]] && (( 10#$v <= 1000 )); then
+    BURST=$((10#$v)); return 0
+  fi
+  echo "${R}Нужно целое число от 0 до 1000.${N}"; return 1
+}
+
 edit_ports() {
   echo "Сейчас на сервере слушают:"
   ss -Hlntup 2>/dev/null | awk '{ p=""; if (match($0,/\(\("[^"]+"/)) p=substr($0,RSTART+3,RLENGTH-4);
@@ -327,6 +357,7 @@ header() {
   echo "  Состояние:     $st"
   echo "  Скачивание:    $(fmt_rate "$DL")"
   echo "  Загрузка:      $(fmt_rate "$UL")"
+  echo "  Буст:          $(fmt_burst)"
   echo "  Порты:         $PORTS"
   echo "  Белый список:  $(wl_count) адр."
   echo "  Автозагрузка:  $au"
@@ -348,6 +379,7 @@ menu() {
     else echo "  ${C}5${N}) Включить автозагрузку (лимит сохранится после перезагрузки)"; fi
     echo "  ${C}6${N}) Клиенты под лимитом"
     echo "  ${C}7${N}) Белый список ($(wl_count))"
+    echo "  ${C}8${N}) Изменить буст"
     echo "  ${C}9${N}) Удалить всё (сброс)"
     echo "  ${C}0${N}) Выход"
     echo
@@ -370,6 +402,7 @@ menu() {
          fi; pause ;;
       6) clients_live ;;
       7) wl_menu ;;
+      8) if ask_burst; then save_conf; reapply; fi; pause ;;
       9) reset_all; pause ;;
       0|q|Q) clear; exit 0 ;;
     esac
@@ -382,6 +415,7 @@ usage() {
   vpnlimit                       меню
   vpnlimit on | off | status     включить / выключить / состояние
   vpnlimit <Мбит>                скорость в обе стороны и включить
+  vpnlimit burst [МБ]            показать или задать буст (0 — без буста)
   vpnlimit wl                    показать белый список
   vpnlimit wl add <IP> [комм.]   добавить IP или подсеть
   vpnlimit wl del <IP>           удалить из белого списка
@@ -393,9 +427,16 @@ load_conf
 case "$1" in
   ""|menu) menu ;;
   on)      rules_on || exit 1
-           echo "Лимит включён: скачивание $(fmt_rate "$DL"), загрузка $(fmt_rate "$UL"), порты $PORTS, белый список: $(wl_count)" ;;
+           echo "Лимит включён: скачивание $(fmt_rate "$DL"), загрузка $(fmt_rate "$UL"), буст: $(fmt_burst), порты $PORTS, белый список: $(wl_count)" ;;
   off)     rules_off; echo "Лимит выключен" ;;
   status)  header ;;
+  burst)   if [ -z "$2" ]; then
+             echo "Буст: $(fmt_burst)"
+           elif [[ "$2" =~ ^[0-9]+$ ]] && (( 10#$2 <= 1000 )); then
+             BURST=$((10#$2)); save_conf; reapply
+           else
+             usage; exit 1
+           fi ;;
   wl|whitelist)
     case "$2" in
       ""|list) wl_show ;;
